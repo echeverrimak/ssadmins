@@ -1,11 +1,11 @@
 USE [master]
 GO
-/****** Object:  StoredProcedure [dbo].[sp_InfoInstancia]    Script Date: 18/05/2023 2:22:20 p. m. ******/
+
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
-ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
+CREATE PROCEDURE [dbo].[sp_InfoInstancia] (
 	@ayuda INT = 0,
 	@propiedades INT = 0,
 	@baseDatos NVARCHAR(50) = '',
@@ -23,8 +23,11 @@ ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@indices INT = 0,
 	@estadisticas INT = 0,
 	@jobs_ejecucion INT = 0,
-	@respaldo INT = 0,
-	@tempdb INT = 0
+	@historialRespaldo INT = 0,
+	@tiempoRespaldo INT = 0,
+	@tiempoRecovery INT = 0,
+	@tempdb INT = 0,
+	@indicesNoUsados INT = 0
 	) WITH RECOMPILE
 AS
 /* **********************************************************************
@@ -59,7 +62,14 @@ FECHA				USUARIO				DESCRIPCION
 2022/09/28			Oscar Echeverri		Incluír validación de la base de datos en la sección de estadísticas
 2022/09/28			Oscar Echeverri		Incluír validación de la base de datos en la sección de estadísticas
 2023/03/07			Oscar Echeverri		Adición de consulta para devolver la información de uso de la tempdb
+2023/09/14			Oscar Echeverri		Modificar consulta historial de respaldos
+2023/09/14			Oscar Echeverri		Adición consulta tiempo estimado de restauración
+2023/09/14			Oscar Echeverri		Adición consulta tiempo estimado de recuperación de la base de datos cuando se inicia la instancia
+2023/10/05			Oscar Echeverri		Actualización de la consulta del parámetro @indices. No estaba tomando el nombre de la base de datos
+2023/11/09			Oscar Echeverri		Adición consulta de índices sin utilizar en la base de datos. Requiere el parámetro @baseDatos
+
 */
+
 BEGIN
     SET NOCOUNT ON;
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
@@ -149,7 +159,7 @@ Parámetros:
 
 @version int - Muestra la versión del motor de base de datos
 
-@respaldo int - Muestra el historial de respaldos de las bases de datos
+@historialRespaldo int - Muestra el historial de respaldos de las bases de datos
 
 @jobs_ejecucion - Muestra los jobs que actualmente se están ejecutando en la instancia'
 
@@ -230,15 +240,15 @@ Parámetros:
 
     IF(@estado = 1)
     BEGIN
-		IF (SELECT COUNT(1) FROM sys.databases WHERE state_desc NOT IN('ONLINE','OFFLINE','EMERGENCY','RESTORING')
-				AND user_access_desc NOT IN('SINGLE_USER','RESTRICTED_USER')) > 0
+		IF (SELECT COUNT(1) FROM sys.databases WHERE state_desc NOT IN('ONLINE')
+				OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')) > 0
 				SELECT	name AS base_datos,
 						state_desc AS estado,
 						user_access_desc AS acceso,
 						GETDATE() AS fecha_actual
 				FROM	sys.databases
-				WHERE	state_desc NOT IN('ONLINE','OFFLINE','EMERGENCY','RESTORING')
-						AND user_access_desc NOT IN('SINGLE_USER','RESTRICTED_USER')
+				WHERE	state_desc NOT IN('ONLINE')
+						OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')
 		ELSE
 				SELECT 'Todas las bases de datos se encuentran en modo ONLINE y MULTI_USER' AS estado_BDs;
     END;
@@ -478,25 +488,46 @@ Parámetros:
 			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
 		ELSE
 		BEGIN
-			SELECT	s.name AS esquema, 
-					t.name AS tabla, 
-					CASE WHEN ips.index_type_desc = 'HEAP' THEN 'Tabla sin índice' ELSE i.name END AS indice,
-					ips.index_type_desc AS tipo_datos,
-					ips.avg_fragmentation_in_percent AS porcentaje,
-					ips.page_count paginas,
-					CASE WHEN (ips.avg_fragmentation_in_percent < 30 AND ips.avg_fragmentation_in_percent > 5) THEN
-								'ALTER INDEX ' + i.name + ' ON ' + s.name + '.' + t.name + ' REORGANIZE;'
-						WHEN (ips.avg_fragmentation_in_percent > 30) THEN
-								'ALTER INDEX ' + i.name + ' ON ' + s.name + '.' + t.name + ' REBUILD;' ELSE
-								'índice con un nivel de fragmentación menor al 5%'
-					END AS sentencia_sql
-			FROM    sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, NULL) AS ips
+			CREATE TABLE #temporalIndices
+			(
+				[base_datos] [sysname] NOT NULL,
+				[esquema] [sysname] NOT NULL,
+				[tabla] [sysname] NOT NULL,
+				[indice] [nvarchar](128) NULL,
+				[tipo_datos] [nvarchar](60) NULL,
+				[porcentaje] [float] NULL,
+				[paginas] [bigint] NULL,
+				[sentencia_sql] [nvarchar](413) NULL
+			);
+
+			INSERT INTO #temporalIndices EXEC sp_MSforeachdb 'USE [?]
+				SELECT	DB_NAME() AS base_datos,
+						s.name AS esquema, 
+						t.name AS tabla, 
+						CASE WHEN ips.index_type_desc = ''HEAP'' THEN ''Tabla sin índice'' ELSE i.name END AS indice,
+						ips.index_type_desc AS tipo_datos,
+						ips.avg_fragmentation_in_percent AS porcentaje,
+						ips.page_count paginas,
+						CASE WHEN (ips.avg_fragmentation_in_percent < 30 AND ips.avg_fragmentation_in_percent > 5) THEN
+									''ALTER INDEX '' + i.name + '' ON '' + s.name + ''.'' + t.name + '' REORGANIZE;''
+							WHEN (ips.avg_fragmentation_in_percent > 30) THEN
+									''ALTER INDEX '' + i.name + '' ON '' + s.name + ''.'' + t.name + '' REBUILD;'' ELSE
+									''índice con un nivel de fragmentación menor al 5%''
+						END AS sentencia_sql
+				FROM    sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, NULL) AS ips
 					JOIN sys.tables AS t ON t.object_id = ips.object_id
 					JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-					JOIN sys.indexes AS i ON
-					i.object_id = ips.object_id AND ips.index_id = i.index_id
-			WHERE   ips.database_id = DB_ID(@baseDatos)      
-			ORDER BY ips.avg_fragmentation_in_percent DESC
+					JOIN sys.indexes AS i ON i.object_id = ips.object_id
+						AND ips.index_id = i.index_id
+				WHERE DB_ID() NOT IN(1,2,3,4)
+					AND t.name <> ''sysdiagrams''
+				ORDER BY ips.avg_fragmentation_in_percent DESC';
+
+			SELECT	*
+			FROM	#temporalIndices
+			WHERE	base_datos = @baseDatos;
+
+			DROP TABLE #temporalIndices;
 		END
     END;
 
@@ -506,6 +537,9 @@ Parámetros:
 			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
 		ELSE
 		BEGIN
+			DECLARE @sqlEstadisticas NVARCHAR(700)
+			SET @sqlEstadisticas = 'USE ' + @baseDatos
+			SET @sqlEstadisticas = @sqlEstadisticas + '
 			SELECT	sp.stats_id,
 					stat.name AS name,
 					stat.filter_definition AS filter_definition,
@@ -515,16 +549,18 @@ Parámetros:
 					sp.steps,
 					sp.unfiltered_rows,
 					sp.modification_counter,
-					'UPDATE STATISTICS ' + OBJECT_SCHEMA_NAME(stat.object_id) + '.' + OBJECT_NAME(stat.object_id) + ' ' + stat.name + ';' AS comando
+					''UPDATE STATISTICS '' + OBJECT_SCHEMA_NAME(stat.object_id) + ''.'' + OBJECT_NAME(stat.object_id) + '' '' + stat.name + '';'' AS comando
 			FROM	sys.stats AS stat   
 				CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp
-			WHERE last_updated < GetDate()-7
+			WHERE last_updated < GETDATE()-7
 				OR modification_counter > rows*.10
-			ORDER BY sp.last_updated DESC;
+			ORDER BY sp.last_updated DESC;'
+
+			EXEC (@sqlEstadisticas);
 		END
     END;
 
-	IF(@respaldo = 1)
+	IF(@historialRespaldo = 1)
 	BEGIN
 		IF(@baseDatos = '' OR @baseDatos IS NULL)		
 				RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
@@ -554,6 +590,19 @@ Parámetros:
 					WHERE bs.database_name = @baseDatos
 			ORDER BY bs.backup_start_date DESC
 		END
+	END;
+	
+	IF(@tiempoRespaldo = 1)
+	BEGIN
+		SELECT	session_id AS sesion,
+				command AS tipo,
+				a.text AS sentencia,
+				start_time AS hora_inicio,
+				percent_complete AS porcentaje,
+				DATEADD(SECOND, estimated_completion_time/1000, GETDATE()) AS hora_estimada_finalizacion
+		FROM	sys.dm_exec_requests AS r
+			CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS a
+		WHERE r.command in ('BACKUP DATABASE','RESTORE DATABASE','BACKUP LOG','RESTORE LOG');
 	END;
 
 	IF(@jobs_ejecucion = 1)
@@ -598,6 +647,91 @@ Parámetros:
 		ORDER BY espacio_liberado_usuario_mb DESC
 	END;
 
+	IF(@tiempoRecovery = 1)
+	BEGIN
+		DECLARE @DBName VARCHAR(64) = 'Warehouse'
+		DECLARE @ErrorLog AS TABLE([LogDate] CHAR(24), [ProcessInfo] VARCHAR(64), [TEXT] VARCHAR(MAX))
+
+		INSERT INTO @ErrorLog
+			EXEC master..sp_readerrorlog 0, 1, 'Recovery of database', @DBName
+
+		INSERT INTO @ErrorLog
+			EXEC master..sp_readerrorlog 0, 1, 'Recovery completed', @DBName
+
+		SELECT	TOP 1
+				@DBName AS [DBName],
+				[LogDate],
+				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+					 THEN '100%'
+					 ELSE SUBSTRING([TEXT], CHARINDEX(') is ', [TEXT]) + 4,CHARINDEX(' complete (', [TEXT]) - CHARINDEX(') is ', [TEXT]) - 4)
+				END AS PercentComplete,
+				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+					 THEN 0
+					 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0
+				END AS MinutesRemaining,
+				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+					 THEN 0
+					 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0/60.0
+				END AS HoursRemaining,
+				[TEXT]
+		FROM	@ErrorLog
+		ORDER BY CAST([LogDate] AS DATETIME) DESC, MinutesRemaining;
+	END;
+
+	IF(@indicesNoUsados = 1)
+	BEGIN
+		IF(@baseDatos = '' OR @baseDatos IS NULL)		
+			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
+		ELSE
+		BEGIN
+			DECLARE @sqlIndices NVARCHAR(2000)
+			SET @sqlIndices = 'USE ' + @baseDatos
+			SET @sqlIndices = @sqlIndices + '
+				IF(SELECT COUNT(1)
+				   FROM sys.sql_modules
+				   WHERE REPLACE(REPLACE(SUBSTRING([definition], CHARINDEX(''WITH'', [definition], 1), 50)  , '' '', ''''),'' '', '''') LIKE ''%WITH(INDEX%'') > 0
+				BEGIN  
+					SELECT	OBJECT_NAME([object_id]) objectName,
+							SUBSTRING([definition], CHARINDEX(''WITH'', [definition], 1), 50) IndexHint
+					FROM	sys.sql_modules
+					WHERE	REPLACE(REPLACE(SUBSTRING([definition], CHARINDEX(''WITH'', [definition], 1), 50)  , '' '', ''''),'' '', '''') LIKE ''%WITH(INDEX%''
+
+					RAISERROR(''¡¡PRECAUCIÓN!! - Actualmente existen uno o varios procedimientos almacenados que tienen un INDEX HINT.... Revisa el resultset'', 16, 1) WITH NOWAIT;
+				END
+				ELSE
+					SELECT	TOP 25 o.name AS ObjectName
+							,i.name AS IndexName
+							,i.index_id AS IndexID
+							,dm_ius.user_seeks AS UserSeek
+							,dm_ius.user_scans AS UserScans
+							,dm_ius.user_lookups AS UserLookups
+							,dm_ius.user_updates AS UserUpdates
+							,p.TableRows
+							,''DROP INDEX '' + QUOTENAME(i.name) + '' ON '' + QUOTENAME(s.name) + ''.'' + QUOTENAME(OBJECT_NAME(dm_ius.OBJECT_ID)) AS ''drop statement''
+					FROM	sys.dm_db_index_usage_stats dm_ius
+						JOIN sys.indexes i ON i.index_id = dm_ius.index_id
+							AND dm_ius.OBJECT_ID = i.OBJECT_ID
+						JOIN sys.objects o ON dm_ius.OBJECT_ID = o.OBJECT_ID
+						JOIN sys.schemas s ON o.schema_id = s.schema_id
+						JOIN (
+						SELECT SUM(p.rows) TableRows
+							,p.index_id
+							,p.OBJECT_ID
+						FROM sys.partitions p
+						GROUP BY p.index_id
+							,p.OBJECT_ID
+						) p ON p.index_id = dm_ius.index_id
+						AND dm_ius.OBJECT_ID = p.OBJECT_ID
+					WHERE OBJECTPROPERTY(dm_ius.OBJECT_ID, ''IsUserTable'') = 1
+						AND dm_ius.database_id = DB_ID()
+						AND i.type_desc = ''nonclustered''
+						AND i.is_primary_key = 0
+						AND i.is_unique_constraint = 0
+					ORDER BY (dm_ius.user_seeks + dm_ius.user_scans + dm_ius.user_lookups) ASC;'
+		END
+		EXEC (@sqlIndices)
+	END;
+
     IF(@ayuda = 0 AND
 	   @propiedades = 0 AND
 	   @servicios = 0 AND
@@ -612,10 +746,13 @@ Parámetros:
 	   @jobs = 0 AND
 	   @bloqueos = 0 AND
 	   @jobs_ejecucion = 0 AND
-	   @respaldo = 0 AND
+	   @historialRespaldo = 0 AND
+	   @tiempoRespaldo = 0 AND
 	   @estadisticas = 0 AND
 	   @indices = 0 AND
-	   @tempdb = 0)
+	   @tiempoRecovery = 0 AND
+	   @tempdb = 0 AND
+	   @indicesNoUsados = 0)
     BEGIN
         SELECT 	'Estado de los servicios'
 
@@ -649,15 +786,15 @@ Parámetros:
 
         SELECT 	'Estado de las bases de datos'
 
-        IF (SELECT COUNT(1) FROM sys.databases WHERE state_desc NOT IN('ONLINE','OFFLINE','EMERGENCY','RESTORING')
-				AND user_access_desc NOT IN('SINGLE_USER','RESTRICTED_USER')) > 0
+        IF (SELECT COUNT(1) FROM sys.databases WHERE state_desc NOT IN('ONLINE')
+				OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')) > 0
 				SELECT	name AS base_datos,
 						state_desc AS estado,
 						user_access_desc AS acceso,
 						GETDATE() AS fecha_actual
 				FROM	sys.databases
-				WHERE	state_desc NOT IN('ONLINE','OFFLINE','EMERGENCY','RESTORING')
-						AND user_access_desc NOT IN('SINGLE_USER','RESTRICTED_USER')
+				WHERE	state_desc NOT IN('ONLINE')
+						OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')
 		ELSE
 				SELECT 'Todas las bases de datos se encuentran en modo ONLINE y MULTI_USER' AS estado_BDs;
 
