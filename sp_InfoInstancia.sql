@@ -4,8 +4,8 @@ GO
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
-GO
-CREATE PROCEDURE [dbo].[sp_InfoInstancia] (
+ 
+ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@ayuda INT = 0,
 	@propiedades INT = 0,
 	@baseDatos NVARCHAR(50) = '',
@@ -22,12 +22,15 @@ CREATE PROCEDURE [dbo].[sp_InfoInstancia] (
 	@bloqueos INT = 0,
 	@indices INT = 0,
 	@estadisticas INT = 0,
-	@jobs_ejecucion INT = 0,
+	@jobsEnEjecucion INT = 0,
 	@historialRespaldo INT = 0,
 	@tiempoRespaldo INT = 0,
 	@tiempoRecovery INT = 0,
 	@tempdb INT = 0,
-	@indicesNoUsados INT = 0
+	@indicesNoUsados INT = 0,
+	@matarSesiones INT = 0,
+    	@deshabilitarReplica INT = 0,
+    	@habilitarReplica INT = 0
 	) WITH RECOMPILE
 AS
 /* **********************************************************************
@@ -67,7 +70,9 @@ FECHA				USUARIO				DESCRIPCION
 2023/09/14			Oscar Echeverri		Adición consulta tiempo estimado de recuperación de la base de datos cuando se inicia la instancia
 2023/10/05			Oscar Echeverri		Actualización de la consulta del parámetro @indices. No estaba tomando el nombre de la base de datos
 2023/11/09			Oscar Echeverri		Adición consulta de índices sin utilizar en la base de datos. Requiere el parámetro @baseDatos
-
+2024/02/29          Oscar Echeverri     Adición consulta para matar sesiones de forma masiva - TODO: modificar para que solo mate sesión bloqueante o sesiones bloqueadas
+2024/02/29          Oscar Echeverri     Adición consulta para deshabilitar replicación de las bases de datos del cluster de alwayson
+2024/02/29          Oscar Echeverri     Adición consulta para habilitar replicación de las bases de datos del cluster de alwayson
 */
 
 BEGIN
@@ -163,7 +168,6 @@ Parámetros:
 
 @jobs_ejecucion - Muestra los jobs que actualmente se están ejecutando en la instancia'
 
-
 	IF (SELECT	CASE WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '8%' THEN 0
 					 WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '9%' THEN 0
 					 WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '11%' THEN 0
@@ -178,7 +182,8 @@ Parámetros:
 	IF(@propiedades = 1)
 	BEGIN
 		SELECT	SERVERPROPERTY('MachineName') AS nombre_maquina, 
-				SERVERPROPERTY('ServerName') AS nombre_instancia, 
+				SERVERPROPERTY('ServerName') AS nombre_instancia,
+				LEFT(@@VERSION, 25) AS version_sql,
 				SERVERPROPERTY('Edition') AS edicion, 
 				SERVERPROPERTY('ProductLevel') AS servicePack,
 				SERVERPROPERTY('ProductUpdateLevel') AS actualizacion,
@@ -248,7 +253,7 @@ Parámetros:
 						GETDATE() AS fecha_actual
 				FROM	sys.databases
 				WHERE	state_desc NOT IN('ONLINE')
-						OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')
+					OR user_access_desc IN('SINGLE_USER','RESTRICTED_USER')
 		ELSE
 				SELECT 'Todas las bases de datos se encuentran en modo ONLINE y MULTI_USER' AS estado_BDs;
     END;
@@ -260,9 +265,9 @@ Parámetros:
 			   vs.logical_volume_name AS nombre_logico,
 			   CONVERT(DECIMAL(18,2), vs.total_bytes/1073741824.0) AS tamano_GB,
 			   CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS espacio_disponible_GB,  
-			   CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS porcentaje_utilizado
+			   CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS porcentaje_disponible
 		FROM   sys.master_files AS mf WITH(NOLOCK)
-			   CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.[file_id]) AS vs
+			CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.[file_id]) AS vs
 		ORDER BY vs.volume_mount_point OPTION(RECOMPILE);
 	END;
 
@@ -280,7 +285,7 @@ Parámetros:
 			    fs.io_stall_write_ms,
 			    fs.num_of_writes
 		FROM    sys.dm_io_virtual_file_stats(NULL,NULL) AS fs
-				JOIN sys.master_files mf WITH(NOLOCK) ON fs.database_id = mf.database_id
+			JOIN sys.master_files mf WITH(NOLOCK) ON fs.database_id = mf.database_id
                 AND fs.[file_id] = mf.[file_id]
 		ORDER BY promedio_io_ms DESC OPTION(RECOMPILE)
 	END;
@@ -292,9 +297,9 @@ Parámetros:
 			    DB_NAME(pa.idbd) AS base_datos,
 				SUM(qs.total_worker_time/1000) AS tiempo_cpu_ms
 		 FROM   sys.dm_exec_query_stats AS qs WITH(NOLOCK)
-			    CROSS APPLY(SELECT CONVERT(int, value) AS idbd 
-						    FROM   sys.dm_exec_plan_attributes(qs.plan_handle)
-							WHERE  attribute = N'dbid') AS pa
+			CROSS APPLY(SELECT CONVERT(int, value) AS idbd 
+						FROM   sys.dm_exec_plan_attributes(qs.plan_handle)
+						WHERE  attribute = N'dbid') AS pa
 		 GROUP BY pa.idbd)
 		SELECT  ROW_NUMBER() OVER(ORDER BY tiempo_cpu_ms DESC) AS uso_cpu,
 			    base_datos,
@@ -416,8 +421,8 @@ Parámetros:
 					lip.state_desc AS estado,
 					'ALTER AVAILABILITY GROUP ' + ag.name + ' ADD LISTENER ''<--Nombre_listener-->'' (WITH IP((''10.XX.XX.XX'',''255.XX.XX.XX'')), PORT = ' + CONVERT(VARCHAR, agl.port) + ')' AS tsql_listener
 			FROM    sys.availability_group_listeners AS agl
-					JOIN sys.availability_group_listener_ip_addresses AS lip ON agl.listener_id = lip.listener_id
-					JOIN sys.availability_groups AS ag on agl.group_id = ag.group_id;
+				JOIN sys.availability_group_listener_ip_addresses AS lip ON agl.listener_id = lip.listener_id
+				JOIN sys.availability_groups AS ag on agl.group_id = ag.group_id;
         END;
     END;
 
@@ -434,7 +439,7 @@ Parámetros:
                mf.type_desc AS tipo,
                CASE WHEN mf.max_size > -1 THEN CONVERT(VARCHAR, mf.max_size) ELSE 'Ilimitado' END AS tamano_asignado_MB
         FROM   sys.master_files AS mf
-               CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
+			CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
         GROUP BY vs.total_bytes, mf.max_size, DB_NAME(mf.database_id), mf.type_desc, vs.available_bytes, vs.volume_mount_point
         ORDER BY DB_NAME(mf.database_id)
     END;
@@ -445,7 +450,8 @@ Parámetros:
                 jh.step_id AS numero_paso,
                 jh.step_name AS nombre_paso,
                 SUBSTRING(j.name,1,140) AS nombre_job,
-                msdb.dbo.agent_datetime(jh.run_date, jh.run_time) AS fecha_ejecucion,
+                msdb.dbo.AGENT_DATETIME(jh.run_date, jh.run_time) AS fecha_ejecucion,
+				STUFF(STUFF(STUFF(RIGHT(REPLICATE('0', 8) + CAST(jh.run_duration as varchar(8)), 8), 3, 0, ':'), 6, 0, ':'), 9, 0, ':') AS Duracion,
                 jh.run_duration duracion_paso,
                 CASE jh.run_status  WHEN 0 THEN 'fallo'
                                     WHEN 1 THEN 'exitoso'
@@ -455,10 +461,10 @@ Parámetros:
                 END AS estado_ejecucion,
                 jh.message AS mensaje_error
         FROM    msdb.dbo.sysjobs AS j
-                JOIN msdb.dbo.sysjobhistory AS jh ON jh.job_id = j.job_id
-        WHERE   jh.run_status NOT IN(1, 4) AND
-                jh.step_id != 0 AND
-                run_date >= CONVERT(CHAR(8), (SELECT DATEADD(DAY,(-1), GETDATE())), 112)
+			JOIN msdb.dbo.sysjobhistory AS jh ON jh.job_id = j.job_id
+        WHERE   jh.run_status NOT IN(1, 4)
+			AND jh.step_id != 0
+			AND run_date >= CONVERT(CHAR(8), (SELECT DATEADD(DAY,(-1), GETDATE())), 112)
     END;
 
     IF(@bloqueos = 1)
@@ -475,8 +481,8 @@ Parámetros:
                     ws.wait_type,
                     ws.wait_duration_ms
              FROM   sys.dm_exec_sessions AS es
-                    JOIN sys.dm_exec_requests AS er ON es.session_id = er.session_id
-                    JOIN sys.dm_os_waiting_tasks AS ws ON es.session_id = ws.session_id
+                JOIN sys.dm_exec_requests AS er ON es.session_id = er.session_id
+                JOIN sys.dm_os_waiting_tasks AS ws ON es.session_id = ws.session_id
              WHERE  er.blocking_session_id > 0
         ELSE
              SELECT 'No hay bloqueo'
@@ -586,7 +592,7 @@ Parámetros:
 					bs.server_name,
 					bs.recovery_model
 			FROM    msdb.dbo.backupset AS bs
-					JOIN msdb.dbo.backupmediafamily AS bmf ON bs.media_set_id = bmf.media_set_id
+				JOIN msdb.dbo.backupmediafamily AS bmf ON bs.media_set_id = bmf.media_set_id
 					WHERE bs.database_name = @baseDatos
 			ORDER BY bs.backup_start_date DESC
 		END
@@ -605,7 +611,7 @@ Parámetros:
 		WHERE r.command in ('BACKUP DATABASE','RESTORE DATABASE','BACKUP LOG','RESTORE LOG');
 	END;
 
-	IF(@jobs_ejecucion = 1)
+	IF(@jobsEnEjecucion = 1)
 	BEGIN
 		SELECT  ja.job_id,
 			    j.name AS job_name,
@@ -619,8 +625,8 @@ Parámetros:
                 JOIN msdb.dbo.sysjobsteps AS js ON ja.job_id = js.job_id
                 AND ISNULL(ja.last_executed_step_id, 0) + 1 = js.step_id
 		WHERE   ja.session_id = (SELECT TOP 1 session_id FROM msdb.dbo.syssessions ORDER BY agent_start_date DESC)
-                AND start_execution_date IS NOT NULL
-                AND stop_execution_date IS NULL
+            AND start_execution_date IS NOT NULL
+            AND stop_execution_date IS NULL
 		ORDER BY ja.start_execution_date ASC
 	END;
 
@@ -732,6 +738,71 @@ Parámetros:
 		EXEC (@sqlIndices)
 	END;
 
+	IF(@matarSesiones = 1)
+	BEGIN
+		-- IF(@baseDatos = '' OR @baseDatos IS NULL)		
+		-- 	RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
+		-- ELSE
+		-- BEGIN
+			DECLARE @sqlKill NVARCHAR(MAX)
+			SELECT  @sqlKill = (SELECT 'KILL ' + CONVERT(VARCHAR, session_id) + ';'
+							FROM   sys.dm_exec_sessions
+							WHERE  is_user_process = 1
+								--AND db_name(database_id) = @baseDatos
+								AND session_id != @@spid
+							FOR XML PATH(''))
+
+			PRINT REPLACE(@sqlKill, ';', CHAR(10))
+			EXEC  sys.sp_executesql @sqlKill
+		-- END;
+	END;
+
+    IF(@deshabilitarReplica = 1)
+    BEGIN
+        IF((SELECT SERVERPROPERTY('IsHadrEnabled')) = 0)
+            SELECT 'La instancia no está habilitada como cluster de alwayson'
+        ELSE
+        BEGIN
+            DECLARE @sqlDeshabilitar NVARCHAR(MAX)
+            SELECT  @sqlDeshabilitar = (SELECT	'ALTER DATABASE [' + adc.database_name + '] SET HADR SUSPEND;'
+                            FROM	sys.dm_hadr_database_replica_states AS drs
+                                JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
+                                    AND drs.group_database_id = adc.group_database_id
+                                JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+                                JOIN sys.availability_replicas AS ar ON drs.group_id = ar.group_id
+                                    AND drs.replica_id = ar.replica_id
+                            WHERE	drs.is_primary_replica = 0
+                            ORDER BY ag.name, ar.replica_server_name, adc.[database_name]
+                            FOR XML PATH('')) 
+
+            PRINT REPLACE(@sqlDeshabilitar, ';', CHAR(10))
+            EXEC  sys.sp_executesql @sqlDeshabilitar
+        END;
+    END;
+
+    IF(@habilitarReplica = 1)
+    BEGIN
+        IF((SELECT SERVERPROPERTY('IsHadrEnabled')) = 0)
+            SELECT 'La instancia no está habilitada como cluster de alwayson'
+        ELSE
+        BEGIN
+            DECLARE @sqlHabilitar NVARCHAR(MAX)
+            SELECT  @sqlHabilitar = (SELECT	'ALTER DATABASE [' + adc.database_name + '] SET HADR RESUME;'
+                            FROM	sys.dm_hadr_database_replica_states AS drs
+                                JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
+                                    AND drs.group_database_id = adc.group_database_id
+                                JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+                                JOIN sys.availability_replicas AS ar ON drs.group_id = ar.group_id
+                                    AND drs.replica_id = ar.replica_id
+                            WHERE	drs.is_primary_replica = 0
+                            ORDER BY ag.name, ar.replica_server_name, adc.[database_name]
+                            FOR XML PATH('')) 
+
+            PRINT REPLACE(@sqlHabilitar, ';', CHAR(10))
+            EXEC  sys.sp_executesql @sqlHabilitar
+        END
+    END;
+
     IF(@ayuda = 0 AND
 	   @propiedades = 0 AND
 	   @servicios = 0 AND
@@ -745,14 +816,17 @@ Parámetros:
 	   @archivosBDs = 0 AND
 	   @jobs = 0 AND
 	   @bloqueos = 0 AND
-	   @jobs_ejecucion = 0 AND
+	   @jobsEnEjecucion = 0 AND
 	   @historialRespaldo = 0 AND
 	   @tiempoRespaldo = 0 AND
 	   @estadisticas = 0 AND
 	   @indices = 0 AND
 	   @tiempoRecovery = 0 AND
 	   @tempdb = 0 AND
-	   @indicesNoUsados = 0)
+	   @indicesNoUsados = 0 AND
+       @matarSesiones = 0 AND
+       @deshabilitarReplica = 0 AND
+       @habilitarReplica = 0)
     BEGIN
         SELECT 	'Estado de los servicios'
 
@@ -801,7 +875,8 @@ Parámetros:
 		SELECT 	'Propiedades de la instancia'
 
 		SELECT	SERVERPROPERTY('MachineName') AS nombre_maquina, 
-				SERVERPROPERTY('ServerName') AS nombre_instancia, 
+				SERVERPROPERTY('ServerName') AS nombre_instancia,
+				LEFT(@@VERSION, 25) AS version_sql,
 				SERVERPROPERTY('Edition') AS edicion, 
 				SERVERPROPERTY('ProductLevel') AS servicePack,
 				SERVERPROPERTY('ProductUpdateLevel') AS actualizacion,
@@ -831,9 +906,9 @@ Parámetros:
 		SELECT 	DISTINCT vs.volume_mount_point AS punto_montaje,
 			   	vs.file_system_type AS tipo_fielsytem,
 			   	vs.logical_volume_name AS nombre_logico,
-			   	vs.total_bytes/1073741824.0 AS tamano_GB,
-			   	vs.available_bytes/1073741824.0 AS espacio_disponible_GB,  
-			   	vs.available_bytes * 1. / vs.total_bytes * 100. AS dispobible_porcentaje
+			   	CONVERT(DECIMAL(18,2), vs.total_bytes/1073741824.0) AS tamano_GB,
+			   	CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS espacio_disponible_GB,  
+			   	CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS porcentaje_disponible
 		FROM   	sys.master_files AS mf WITH(NOLOCK)
 			   	CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.[file_id]) AS vs
 		ORDER BY vs.volume_mount_point OPTION(RECOMPILE);
@@ -852,7 +927,7 @@ Parámetros:
 			   	fs.io_stall_write_ms,
 			   	fs.num_of_writes
 		FROM   	sys.dm_io_virtual_file_stats(NULL,NULL) AS fs
-				JOIN sys.master_files AS mf WITH(NOLOCK) ON fs.database_id = mf.database_id
+			JOIN sys.master_files AS mf WITH(NOLOCK) ON fs.database_id = mf.database_id
 			   	AND fs.[file_id] = mf.[file_id]
 		ORDER BY promedio_io_ms DESC OPTION(RECOMPILE)
 
@@ -946,8 +1021,8 @@ Parámetros:
 				lip.state_desc AS estado,
 				'ALTER AVAILABILITY GROUP ' + ag.name + ' ADD LISTENER ''<--Nombre_listener-->'' (WITH IP((''10.XX.XX.XX'',''255.XX.XX.XX'')), PORT = ' + CONVERT(VARCHAR, agl.port) + ')' AS tsql_listener
 		FROM    sys.availability_group_listeners AS agl
-				JOIN sys.availability_group_listener_ip_addresses AS lip ON agl.listener_id = lip.listener_id
-				JOIN sys.availability_groups AS ag on agl.group_id = ag.group_id;
+			JOIN sys.availability_group_listener_ip_addresses AS lip ON agl.listener_id = lip.listener_id
+			JOIN sys.availability_groups AS ag on agl.group_id = ag.group_id;
 
         SELECT 	'Tamaño filegropus'
 
@@ -962,7 +1037,7 @@ Parámetros:
                	mf.type_desc AS tipo,
                	CASE WHEN mf.max_size > -1 THEN CONVERT(VARCHAR, mf.max_size) ELSE 'Ilimitado' END AS tamano_asignado_MB
         FROM   	sys.master_files mf
-               	CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
         GROUP BY vs.total_bytes, mf.max_size, DB_NAME(mf.database_id), mf.type_desc, vs.available_bytes, vs.volume_mount_point
         ORDER BY DB_NAME(mf.database_id)
     
@@ -982,10 +1057,10 @@ Parámetros:
                	END AS estado_ejecucion,
                	jh.message AS mensaje_error
         FROM   	msdb.dbo.sysjobs AS j
-				JOIN msdb.dbo.sysjobhistory AS jh ON jh.job_id = j.job_id
+			JOIN msdb.dbo.sysjobhistory AS jh ON jh.job_id = j.job_id
         WHERE  	jh.run_status NOT IN(1, 4)
-				AND jh.step_id != 0
-				AND	run_date >= CONVERT(CHAR(8), (SELECT DATEADD(DAY,(-1), GETDATE())), 112)
+			AND jh.step_id != 0
+			AND	run_date >= CONVERT(CHAR(8), (SELECT DATEADD(DAY,(-1), GETDATE())), 112)
 
         SELECT 	'Bloqueos en la instancia'
 
@@ -1001,8 +1076,8 @@ Parámetros:
                    	ws.wait_type,
                    	ws.wait_duration_ms
             FROM   	sys.dm_exec_sessions AS es
-					JOIN sys.dm_exec_requests AS er ON es.session_id = er.session_id
-					JOIN sys.dm_os_waiting_tasks ws ON es.session_id = ws.session_id
+				JOIN sys.dm_exec_requests AS er ON es.session_id = er.session_id
+				JOIN sys.dm_os_waiting_tasks ws ON es.session_id = ws.session_id
             WHERE  	er.blocking_session_id > 0
         ELSE
             SELECT 'No hay bloqueo'
@@ -1016,12 +1091,12 @@ Parámetros:
 			   	js.step_name,
 			   	js.command
 		FROM   	msdb.dbo.sysjobactivity AS ja
-				LEFT JOIN msdb.dbo.sysjobhistory AS jh ON ja.job_history_id = jh.instance_id
-				JOIN msdb.dbo.sysjobs AS j ON ja.job_id = j.job_id
-				JOIN msdb.dbo.sysjobsteps AS js ON ja.job_id = js.job_id
+			LEFT JOIN msdb.dbo.sysjobhistory AS jh ON ja.job_history_id = jh.instance_id
+			JOIN msdb.dbo.sysjobs AS j ON ja.job_id = j.job_id
+			JOIN msdb.dbo.sysjobsteps AS js ON ja.job_id = js.job_id
 				AND ISNULL(ja.last_executed_step_id, 0) + 1 = js.step_id
 		WHERE  	ja.session_id = (SELECT TOP 1 session_id FROM msdb.dbo.syssessions ORDER BY agent_start_date DESC)
-				AND	start_execution_date IS NOT NULL
-				AND	stop_execution_date IS NULL
+			AND	start_execution_date IS NOT NULL
+			AND	stop_execution_date IS NULL
 		ORDER BY ja.start_execution_date ASC
 	END
