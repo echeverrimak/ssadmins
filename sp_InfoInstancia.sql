@@ -1,10 +1,10 @@
 USE [master]
 GO
-
+/****** Object:  StoredProcedure [dbo].[sp_InfoInstancia]    Script Date: 8/04/2024 7:41:45 a. m. ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
- 
+GO
 ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@ayuda INT = 0,
 	@propiedades INT = 0,
@@ -29,8 +29,8 @@ ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@tempdb INT = 0,
 	@indicesNoUsados INT = 0,
 	@matarSesiones INT = 0,
-    	@deshabilitarReplica INT = 0,
-    	@habilitarReplica INT = 0
+    @deshabilitarReplica INT = 0,
+    @habilitarReplica INT = 0
 	) WITH RECOMPILE
 AS
 /* **********************************************************************
