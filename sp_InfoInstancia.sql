@@ -1,14 +1,10 @@
 USE [master]
 GO
-/****** Object:  StoredProcedure [dbo].[sp_InfoInstancia]    Script Date: 8/04/2024 7:41:45 a. m. ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
-GO
-ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
+
+CREATE OR ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@ayuda INT = 0,
 	@propiedades INT = 0,
-	@baseDatos NVARCHAR(50) = '',
+	@baseDatos VARCHAR(50) = '',
 	@servicios INT = 0,
 	@estado INT = 0,
 	@discos INT = 0,
@@ -30,7 +26,10 @@ ALTER PROCEDURE [dbo].[sp_InfoInstancia] (
 	@indicesNoUsados INT = 0,
 	@matarSesiones INT = 0,
     @deshabilitarReplica INT = 0,
-    @habilitarReplica INT = 0
+    @habilitarReplica INT = 0,
+	@noSargable INT = 0,
+	@estadisticasTabla INT = 0,
+	@tabla VARCHAR(50) = ''
 	) WITH RECOMPILE
 AS
 /* **********************************************************************
@@ -73,6 +72,8 @@ FECHA				USUARIO				DESCRIPCION
 2024/02/29          Oscar Echeverri     Adición consulta para matar sesiones de forma masiva - TODO: modificar para que solo mate sesión bloqueante o sesiones bloqueadas
 2024/02/29          Oscar Echeverri     Adición consulta para deshabilitar replicación de las bases de datos del cluster de alwayson
 2024/02/29          Oscar Echeverri     Adición consulta para habilitar replicación de las bases de datos del cluster de alwayson
+2024/04/26			Oscar Echeverri		Adición consulta de Bert Wagner para revisar las consultas nonSARGAble en la caché
+2024/05/06			Oscar Echeverri		Adición consulta para devolver la información de las estadísticas de una tabla en partícular
 */
 
 BEGIN
@@ -168,9 +169,9 @@ Parámetros:
 
 @jobs_ejecucion - Muestra los jobs que actualmente se están ejecutando en la instancia'
 
-	IF (SELECT	CASE WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '8%' THEN 0
-					 WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '9%' THEN 0
-					 WHEN CONVERT(NVARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '11%' THEN 0
+	IF (SELECT	CASE WHEN CONVERT(VARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '8%' THEN 0
+					 WHEN CONVERT(VARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '9%' THEN 0
+					 WHEN CONVERT(VARCHAR(128), SERVERPROPERTY('PRODUCTVERSION')) LIKE '11%' THEN 0
 				ELSE 1 END) = 0
 	BEGIN
 		DECLARE @mensaje VARCHAR(80); 
@@ -215,7 +216,7 @@ Parámetros:
 				CONNECTIONPROPERTY('local_net_address') AS direccion_ip,
 				CONNECTIONPROPERTY('local_tcp_port') AS puerto
 
-		DECLARE @sqlcmd NVARCHAR(max), @params NVARCHAR(600), @sqlmajorver INT
+		DECLARE @sqlcmd VARCHAR(max), @params VARCHAR(600), @sqlmajorver INT
 		DECLARE @UpTime VARCHAR(12),@StartDate DATETIME
 
 		SELECT @sqlmajorver = CONVERT(INT, (@@MICROSOFTVERSION / 0x1000000) & 0xff);
@@ -329,14 +330,14 @@ Parámetros:
 	BEGIN
 		CREATE TABLE #memoriaInstancia
 		(
-			nombreInstancia NVARCHAR(50),
+			nombreInstancia VARCHAR(50),
 			usoMemoriaSQL_mb INT,
 			memoriaSQL_mb INT,
 			memoriaSO_mb INT,
 			memoriaDisponibleSO_mb INT
 		)
 
-		DECLARE @nombreInstancia NVARCHAR(50)
+		DECLARE @nombreInstancia VARCHAR(50)
 		DECLARE @usoMemoriaSQL INT
 		DECLARE @memoriaSQL INT
 		DECLARE @memoriaSO INT
@@ -385,7 +386,7 @@ Parámetros:
         ELSE
             SELECT	ag.name AS nombre_grupo,
 					adc.database_name AS base_datos,
-                    CASE drs.is_local WHEN 1 THEN 'PRIMARIO' ELSE 'SECUNDARIO' END AS nodo,
+					CASE drs.is_local WHEN 1 THEN 'PRIMARIO' ELSE 'SECUNDARIO' END AS nodo,
 					ar.replica_server_name AS instancia_replica,
 					ar.endpoint_url AS endpoint,
 					ar.availability_mode_desc AS modo_sincronizacion,
@@ -396,12 +397,14 @@ Parámetros:
 					ar.seeding_mode_desc AS modo_semilla,
 					ag.automated_backup_preference_desc AS preferencia_respaldo,
 					CASE drs.is_suspended WHEN 0 THEN 'No'
-										  WHEN 1 THEN 'Si' END AS suspendida,
+											WHEN 1 THEN 'Si' END AS suspendida,
 					drs.database_state_desc AS estado_bd,
 					drs.suspend_reason_desc AS motivo_suspension,
 					drs.synchronization_health_desc AS estado_cluster,
 					drs.synchronization_state_desc AS estado_sincronizacion,
-					drs.secondary_lag_seconds AS segundos_retrazo
+					drs.secondary_lag_seconds AS segundos_retrazo,
+					drs.log_send_queue_size AS tamano_log_pendiente_kb,
+					drs.redo_queue_size AS tamano_log_kb
 			FROM	sys.dm_hadr_database_replica_states AS drs
 				JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
 					AND drs.group_database_id = adc.group_database_id
@@ -485,7 +488,7 @@ Parámetros:
                 JOIN sys.dm_os_waiting_tasks AS ws ON es.session_id = ws.session_id
              WHERE  er.blocking_session_id > 0
         ELSE
-             SELECT 'No hay bloqueo'
+             SELECT 'No se observan sesiones bloqueantes en la instancia'
     END;
 
     IF(@indices = 1)
@@ -499,11 +502,11 @@ Parámetros:
 				[base_datos] [sysname] NOT NULL,
 				[esquema] [sysname] NOT NULL,
 				[tabla] [sysname] NOT NULL,
-				[indice] [nvarchar](128) NULL,
-				[tipo_datos] [nvarchar](60) NULL,
+				[indice] [VARCHAR](128) NULL,
+				[tipo_datos] [VARCHAR](60) NULL,
 				[porcentaje] [float] NULL,
 				[paginas] [bigint] NULL,
-				[sentencia_sql] [nvarchar](413) NULL
+				[sentencia_sql] [VARCHAR](413) NULL
 			);
 
 			INSERT INTO #temporalIndices EXEC sp_MSforeachdb 'USE [?]
@@ -543,7 +546,7 @@ Parámetros:
 			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
 		ELSE
 		BEGIN
-			DECLARE @sqlEstadisticas NVARCHAR(700)
+			DECLARE @sqlEstadisticas VARCHAR(700)
 			SET @sqlEstadisticas = 'USE ' + @baseDatos
 			SET @sqlEstadisticas = @sqlEstadisticas + '
 			SELECT	sp.stats_id,
@@ -655,33 +658,37 @@ Parámetros:
 
 	IF(@tiempoRecovery = 1)
 	BEGIN
-		DECLARE @DBName VARCHAR(64) = 'Warehouse'
-		DECLARE @ErrorLog AS TABLE([LogDate] CHAR(24), [ProcessInfo] VARCHAR(64), [TEXT] VARCHAR(MAX))
+		IF(@baseDatos = '' OR @baseDatos IS NULL)		
+				RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
+			ELSE
+			BEGIN
+				DECLARE @ErrorLog AS TABLE([LogDate] CHAR(24), [ProcessInfo] VARCHAR(64), [TEXT] VARCHAR(MAX))
 
-		INSERT INTO @ErrorLog
-			EXEC master..sp_readerrorlog 0, 1, 'Recovery of database', @DBName
+				INSERT INTO @ErrorLog
+					EXEC master..sp_readerrorlog 0, 1, 'Recovery of database', @baseDatos
 
-		INSERT INTO @ErrorLog
-			EXEC master..sp_readerrorlog 0, 1, 'Recovery completed', @DBName
+				INSERT INTO @ErrorLog
+					EXEC master..sp_readerrorlog 0, 1, 'Recovery completed', @baseDatos
 
-		SELECT	TOP 1
-				@DBName AS [DBName],
-				[LogDate],
-				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
-					 THEN '100%'
-					 ELSE SUBSTRING([TEXT], CHARINDEX(') is ', [TEXT]) + 4,CHARINDEX(' complete (', [TEXT]) - CHARINDEX(') is ', [TEXT]) - 4)
-				END AS PercentComplete,
-				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
-					 THEN 0
-					 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0
-				END AS MinutesRemaining,
-				CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
-					 THEN 0
-					 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0/60.0
-				END AS HoursRemaining,
-				[TEXT]
-		FROM	@ErrorLog
-		ORDER BY CAST([LogDate] AS DATETIME) DESC, MinutesRemaining;
+				SELECT	TOP 1
+						@baseDatos AS [DBName],
+						[LogDate],
+						CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+							 THEN '100%'
+							 ELSE SUBSTRING([TEXT], CHARINDEX(') is ', [TEXT]) + 4,CHARINDEX(' complete (', [TEXT]) - CHARINDEX(') is ', [TEXT]) - 4)
+						END AS PercentComplete,
+						CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+							 THEN 0
+							 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0
+						END AS MinutesRemaining,
+						CASE WHEN SUBSTRING([TEXT],10,1) = 'c'
+							 THEN 0
+							 ELSE CAST(SUBSTRING([TEXT], CHARINDEX('approximately', [TEXT]) + 13,CHARINDEX(' seconds remain', [TEXT]) - CHARINDEX('approximately', [TEXT]) - 13) AS FLOAT)/60.0/60.0
+						END AS HoursRemaining,
+						[TEXT]
+				FROM	@ErrorLog
+				ORDER BY CAST([LogDate] AS DATETIME) DESC, MinutesRemaining;
+			END;
 	END;
 
 	IF(@indicesNoUsados = 1)
@@ -690,7 +697,7 @@ Parámetros:
 			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
 		ELSE
 		BEGIN
-			DECLARE @sqlIndices NVARCHAR(2000)
+			DECLARE @sqlIndices VARCHAR(2000)
 			SET @sqlIndices = 'USE ' + @baseDatos
 			SET @sqlIndices = @sqlIndices + '
 				IF(SELECT COUNT(1)
@@ -744,7 +751,7 @@ Parámetros:
 		-- 	RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
 		-- ELSE
 		-- BEGIN
-			DECLARE @sqlKill NVARCHAR(MAX)
+			DECLARE @sqlKill VARCHAR(MAX)
 			SELECT  @sqlKill = (SELECT 'KILL ' + CONVERT(VARCHAR, session_id) + ';'
 							FROM   sys.dm_exec_sessions
 							WHERE  is_user_process = 1
@@ -763,7 +770,7 @@ Parámetros:
             SELECT 'La instancia no está habilitada como cluster de alwayson'
         ELSE
         BEGIN
-            DECLARE @sqlDeshabilitar NVARCHAR(MAX)
+            DECLARE @sqlDeshabilitar VARCHAR(MAX)
             SELECT  @sqlDeshabilitar = (SELECT	'ALTER DATABASE [' + adc.database_name + '] SET HADR SUSPEND;'
                             FROM	sys.dm_hadr_database_replica_states AS drs
                                 JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
@@ -786,7 +793,7 @@ Parámetros:
             SELECT 'La instancia no está habilitada como cluster de alwayson'
         ELSE
         BEGIN
-            DECLARE @sqlHabilitar NVARCHAR(MAX)
+            DECLARE @sqlHabilitar VARCHAR(MAX)
             SELECT  @sqlHabilitar = (SELECT	'ALTER DATABASE [' + adc.database_name + '] SET HADR RESUME;'
                             FROM	sys.dm_hadr_database_replica_states AS drs
                                 JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
@@ -802,6 +809,87 @@ Parámetros:
             EXEC  sys.sp_executesql @sqlHabilitar
         END
     END;
+
+	IF(@noSargable = 1)
+	BEGIN
+		IF(@baseDatos = '' OR @baseDatos IS NULL)		
+			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
+		ELSE
+		BEGIN
+			DECLARE @sqlSargable VARCHAR(2000)
+			SET @sqlSargable = 'USE ' + @baseDatos
+			SET @sqlSargable = @sqlSargable + '
+			-- From https://github.com/bertwagner/SQLServer/blob/master/Non-SARGable%20Execution%20Plans.sql
+			-- This script will check the execution plan cache for any queries that are non-SARGable.
+			-- It does this by finding table and index scans that contain a scalar operators
+
+			SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+
+			DECLARE @dbname SYSNAME
+			SET @dbname = QUOTENAME(DB_NAME());
+
+			WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
+
+			SELECT
+			   stmt.value(''(@StatementText)[1]'', ''varchar(max)'') AS [Query],
+			   query_plan AS [QueryPlan],
+			   sc.value(''(.//Identifier/ColumnReference/@Schema)[1]'', ''varchar(128)'') AS [Schema], 
+			   sc.value(''(.//Identifier/ColumnReference/@Table)[1]'', ''varchar(128)'') AS [Table], 
+			   sc.value(''(.//Identifier/ColumnReference/@Column)[1]'', ''varchar(128)'') AS [Column] ,
+			   CASE WHEN s.exist(''.//TableScan'') = 1 THEN ''TableScan'' ELSE ''IndexScan'' END AS [ScanType],
+			   sc.value(''(@ScalarString)[1]'', ''varchar(128)'') AS [ScalarString]
+			FROM 
+				sys.dm_exec_cached_plans AS cp
+				CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) AS qp
+				CROSS APPLY query_plan.nodes(''/ShowPlanXML/BatchSequence/Batch/Statements/StmtSimple'') AS batch(stmt)
+				CROSS APPLY stmt.nodes(''.//RelOp[TableScan or IndexScan]'') AS scan(s)
+				CROSS APPLY s.nodes(''.//ScalarOperator'') AS scalar(sc)
+			WHERE
+				s.exist(''.//ScalarOperator[@ScalarString]!=""'') = 1 
+				AND sc.exist(''.//Identifier/ColumnReference[@Database=sql:variable("@dbname")][@Schema!="[sys]"]'') = 1
+				AND sc.value(''(@ScalarString)[1]'', ''varchar(128)'') IS NOT NULL'
+		END
+		EXEC (@sqlSargable);
+	END;
+
+	IF(@estadisticasTabla = 1)
+	BEGIN
+		IF(@baseDatos = '' OR @baseDatos IS NULL)		
+			RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@baseDatos''', 1, 1);
+		ELSE
+		BEGIN
+			IF(@tabla = '' OR @tabla IS NULL)
+				RAISERROR ('Por favor ingresar el nombre de la base de datos en el parámetro ''@tabla''', 1, 1);
+			ELSE
+			BEGIN
+				DECLARE @sqlStats VARCHAR(2000)
+				SET @sqlStats = 'USE ' + @baseDatos
+				SET @sqlStats = @sqlStats + '
+				SELECT	so.name,
+						st.name,
+						st.stats_id,
+						sc.stats_column_id,
+						c.name AS column_name,
+						st.auto_created,
+						st.filter_definition,
+						sp.last_updated,
+						sp.rows,
+						sp.rows_sampled,
+						sp.steps,
+						sp.modification_counter
+				FROM	sys.stats AS st
+					JOIN sys.stats_columns AS sc ON st.object_id = sc.object_id
+						AND st.stats_id = sc.stats_id
+					JOIN sys.columns AS c ON sc.object_id = c.object_id
+						AND sc.column_id = c.column_id
+					JOIN sys.objects AS so ON st.object_id = so.object_id
+					CROSS APPLY sys.dm_db_stats_properties(st.object_id, st.stats_id) AS sp
+				WHERE so.name = ''' + @tabla + '''
+				ORDER BY so.name, st.stats_id, sc.stats_column_id;'
+			END
+		END
+		EXEC (@sqlStats);
+	END;
 
     IF(@ayuda = 0 AND
 	   @propiedades = 0 AND
@@ -826,9 +914,14 @@ Parámetros:
 	   @indicesNoUsados = 0 AND
        @matarSesiones = 0 AND
        @deshabilitarReplica = 0 AND
-       @habilitarReplica = 0)
+       @habilitarReplica = 0 AND
+	   @noSargable = 0 AND
+	   @estadisticasTabla = 0)
     BEGIN
         SELECT 	'Estado de los servicios'
+		
+		--DECLARE @sqlcmd VARCHAR(max), @params VARCHAR(600), @sqlmajorver INT
+		--DECLARE @UpTime VARCHAR(12),@StartDate DATETIME
 
         SELECT	SERVERPROPERTY('MachineName') AS nombre_maquina,
 				CONNECTIONPROPERTY('local_net_address') AS direccion_ip,
@@ -913,24 +1006,6 @@ Parámetros:
 			   	CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.[file_id]) AS vs
 		ORDER BY vs.volume_mount_point OPTION(RECOMPILE);
 
-		SELECT 	'Latencia de los discos'
-
-		SELECT 	DB_NAME(fs.database_id) AS base_datos,
-			   	CAST(fs.io_stall_read_ms/(1.0 + fs.num_of_reads) AS NUMERIC(10,1)) AS promedio_lectura_ms,
-			   	CAST(fs.io_stall_write_ms/(1.0 + fs.num_of_writes) AS NUMERIC(10,1)) AS promedio_escritura_ms,
-			   	CAST((fs.io_stall_read_ms + fs.io_stall_write_ms)/(1.0 + fs.num_of_reads + fs.num_of_writes) AS NUMERIC(10,1)) AS promedio_io_ms,
-			   	CONVERT(DECIMAL(18,2), mf.size/128.0) AS tamano_archivo_MB,
-			   	mf.physical_name,
-			   	mf.type_desc,
-			   	fs.io_stall_read_ms,
-			   	fs.num_of_reads, 
-			   	fs.io_stall_write_ms,
-			   	fs.num_of_writes
-		FROM   	sys.dm_io_virtual_file_stats(NULL,NULL) AS fs
-			JOIN sys.master_files AS mf WITH(NOLOCK) ON fs.database_id = mf.database_id
-			   	AND fs.[file_id] = mf.[file_id]
-		ORDER BY promedio_io_ms DESC OPTION(RECOMPILE)
-
 		SELECT 	'Estadísticas CPU'
 
 		;WITH estadisticas_cpu AS
@@ -945,24 +1020,10 @@ Parámetros:
 		SELECT 	ROW_NUMBER() OVER(ORDER BY tiempo_cpu_ms DESC) AS uso_cpu,
 			   	base_datos,
 			   	tiempo_cpu_ms, 
-			   	CAST(tiempo_cpu_ms * 1.0 / SUM(tiempo_cpu_ms) OVER() * 100.0 AS DECIMAL(5, 2)) AS porcentaje_uso_cpu
+			   	CAST(tiempo_cpu_ms * 1.0 / NULLIF(SUM(tiempo_cpu_ms) OVER() * 100.0, 0) AS DECIMAL(5, 2)) AS porcentaje_uso_cpu
 		FROM   	estadisticas_cpu
 		WHERE  	idbd <> 32767 -- ResourceDB
 		ORDER BY uso_cpu OPTION(RECOMPILE);
-
-		SELECT 	'Estadísticas Discos'
-
-		;WITH estadisticas_io AS
-		(SELECT DB_NAME(fs.database_id) AS base_datos,
-			    CAST(SUM(fs.num_of_bytes_read + fs.num_of_bytes_written) / 1048576 AS DECIMAL(12, 2)) AS io_mb
-		 FROM   sys.dm_io_virtual_file_stats(NULL, NULL) AS fs
-		 GROUP BY fs.database_id)
-		SELECT ROW_NUMBER() OVER(ORDER BY io_mb DESC) AS uso_disco,
-			   base_datos,
-			   io_mb AS io_total_mb,
-			   CAST(io_mb / SUM(io_mb) OVER() * 100.0 AS DECIMAL(5,2)) AS porcentaje_uso_disco
-		FROM   estadisticas_io
-		ORDER BY uso_disco OPTION(RECOMPILE);
 
 		SELECT 	'Estadísticas Memoria'
 
@@ -978,89 +1039,6 @@ Parámetros:
 				CAST(tamano_cache / SUM(tamano_cache) OVER() * 100.0 AS DECIMAL(5,2)) AS porcentaje_uso_memoria
 		FROM   estadisticas_memoria
 		ORDER BY uso_memoria OPTION(RECOMPILE);
-
-        SELECT 	'Estado de las bases de datos en Alwayson'
-        IF((SELECT SERVERPROPERTY('IsHadrEnabled')) = 0)
-            SELECT 'La instancia NO está habilitada como cluster de alwayson'
-        ELSE
-        SELECT	ag.name AS nombre_grupo,
-				adc.database_name AS base_datos,
-                CASE drs.is_local WHEN 1 THEN 'PRIMARIO' ELSE 'SECUNDARIO' END AS nodo,
-				ar.replica_server_name AS instancia_replica,
-				ar.endpoint_url AS endpoint,
-				ar.availability_mode_desc AS modo_sincronizacion,
-				ar.failover_mode_desc AS tipo_failover,
-				ar.read_only_routing_url AS ruta_solo_lectura,
-				ar.primary_role_allow_connections_desc AS conexiones_en_primario,
-				ar.secondary_role_allow_connections_desc AS conexiones_en_secundario,
-				ar.seeding_mode_desc AS modo_semilla,
-				ag.automated_backup_preference_desc AS preferencia_respaldo,
-				CASE drs.is_suspended WHEN 0 THEN 'No'
-										WHEN 1 THEN 'Si' END AS suspendida,
-				drs.database_state_desc AS estado_bd,
-				drs.suspend_reason_desc AS motivo_suspension,
-				drs.synchronization_health_desc AS estado_cluster,
-				drs.synchronization_state_desc AS estado_sincronizacion,
-				drs.secondary_lag_seconds AS segundos_retrazo
-		FROM	sys.dm_hadr_database_replica_states AS drs
-			JOIN sys.availability_databases_cluster AS adc ON drs.group_id = adc.group_id
-				AND drs.group_database_id = adc.group_database_id
-			JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
-			JOIN sys.availability_replicas AS ar ON drs.group_id = ar.group_id
-				AND drs.replica_id = ar.replica_id
-		WHERE	drs.is_primary_replica = 0
-		ORDER BY ag.name, ar.replica_server_name, adc.[database_name] OPTION(RECOMPILE);
-
-		SELECT  ag.name AS grupo_disponibilidad,
-				agl.dns_name AS listener,
-				agl.port AS puerto,
-				agl.ip_configuration_string_FROM_cluster AS cadena_configuracion_del_cluster,
-				lip.ip_address AS direccion_IP,
-				lip.ip_subnet_mask AS mascara_subred,
-				CASE lip.is_dhcp WHEN 0 THEN 'NO' WHEN 1 THEN 'SI' END AS DHCP,
-				lip.state_desc AS estado,
-				'ALTER AVAILABILITY GROUP ' + ag.name + ' ADD LISTENER ''<--Nombre_listener-->'' (WITH IP((''10.XX.XX.XX'',''255.XX.XX.XX'')), PORT = ' + CONVERT(VARCHAR, agl.port) + ')' AS tsql_listener
-		FROM    sys.availability_group_listeners AS agl
-			JOIN sys.availability_group_listener_ip_addresses AS lip ON agl.listener_id = lip.listener_id
-			JOIN sys.availability_groups AS ag on agl.group_id = ag.group_id;
-
-        SELECT 	'Tamaño filegropus'
-
-        SELECT 	@@SERVERNAME AS instancia,
-               	DB_NAME(mf.database_id) AS base_de_datos,
-               	vs.volume_mount_point AS disco,
-               	CASE WHEN mf.max_size > -1 THEN	(CAST(SUM(mf.max_size)*8./1024 AS DECIMAL(8,0)))
-				     ELSE (CAST(vs.total_bytes/1048576.0 AS DECIMAL(8,0))) END AS total_asignado_MB,
-               	CAST(SUM(mf.size)*8./1024 AS DECIMAL(8,0)) AS actual_MB,
-               	CAST(vs.total_bytes/1048576.0 AS DECIMAL(8,0)) - CAST(SUM(mf.size)*8./1024 AS DECIMAL(8,0)) AS libre,
-               	CAST(vs.total_bytes/1048576.0 AS DECIMAL(8,0)) AS total_disco_MB,
-               	mf.type_desc AS tipo,
-               	CASE WHEN mf.max_size > -1 THEN CONVERT(VARCHAR, mf.max_size) ELSE 'Ilimitado' END AS tamano_asignado_MB
-        FROM   	sys.master_files mf
-            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
-        GROUP BY vs.total_bytes, mf.max_size, DB_NAME(mf.database_id), mf.type_desc, vs.available_bytes, vs.volume_mount_point
-        ORDER BY DB_NAME(mf.database_id)
-    
-        SELECT 	'Jobs fallidos'
-
-        SELECT 	DISTINCT jh.server AS instancia,
-               	jh.step_id AS numero_paso,
-               	jh.step_name AS nombre_paso,
-               	substring(j.name,1,140) AS nombre_job,
-               	msdb.dbo.agent_datetime(jh.run_date, jh.run_time) AS fecha_ejecucion,
-               	jh.run_duration duracion_paso,
-               	CASE jh.run_status WHEN 0 THEN 'fallo'
-               	                   WHEN 1 THEN 'exitoso'
-               	                   WHEN 2 THEN 'reintento...'
-               	                   WHEN 3 THEN 'cancelado'
-               	                   WHEN 4 THEN 'en progreso...'
-               	END AS estado_ejecucion,
-               	jh.message AS mensaje_error
-        FROM   	msdb.dbo.sysjobs AS j
-			JOIN msdb.dbo.sysjobhistory AS jh ON jh.job_id = j.job_id
-        WHERE  	jh.run_status NOT IN(1, 4)
-			AND jh.step_id != 0
-			AND	run_date >= CONVERT(CHAR(8), (SELECT DATEADD(DAY,(-1), GETDATE())), 112)
 
         SELECT 	'Bloqueos en la instancia'
 
@@ -1080,23 +1058,5 @@ Parámetros:
 				JOIN sys.dm_os_waiting_tasks ws ON es.session_id = ws.session_id
             WHERE  	er.blocking_session_id > 0
         ELSE
-            SELECT 'No hay bloqueo'
-
-        SELECT 'Jobs en ejecución'
-
-		SELECT 	ja.job_id,
-			   	j.name AS job_name,
-			   	ja.start_execution_date,      
-			   	ISNULL(last_executed_step_id, 0) + 1 AS current_executed_step_id,
-			   	js.step_name,
-			   	js.command
-		FROM   	msdb.dbo.sysjobactivity AS ja
-			LEFT JOIN msdb.dbo.sysjobhistory AS jh ON ja.job_history_id = jh.instance_id
-			JOIN msdb.dbo.sysjobs AS j ON ja.job_id = j.job_id
-			JOIN msdb.dbo.sysjobsteps AS js ON ja.job_id = js.job_id
-				AND ISNULL(ja.last_executed_step_id, 0) + 1 = js.step_id
-		WHERE  	ja.session_id = (SELECT TOP 1 session_id FROM msdb.dbo.syssessions ORDER BY agent_start_date DESC)
-			AND	start_execution_date IS NOT NULL
-			AND	stop_execution_date IS NULL
-		ORDER BY ja.start_execution_date ASC
+            SELECT 'No se observan sesiones bloqueantes en la instancia'
 	END
